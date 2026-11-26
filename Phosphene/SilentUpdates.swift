@@ -82,10 +82,6 @@ final class SilentUpdates {
     /// True briefly after a successful explicit check found no installable update.
     private(set) var checkedNoInstallableUpdate = false
 
-    var isReplacingApp: Bool {
-        activity.isReplacingApp
-    }
-
     /// The updater: check loop, plus the quiet-moment install when auto-update is on.
     /// Created up front so its `Tiptoe` reconciles the recorded wait and the post-update notice
     /// against the running bundle (a notice that outlived its version is dropped) before the
@@ -107,7 +103,7 @@ final class SilentUpdates {
     private init() {
         updater = AppUpdater(owner: Self.owner, repo: Self.repo)
         tiptoe = Tiptoe()
-        activity = UpdateActivity(tiptoe: tiptoe) { Self.noOptimizationRunning() }
+        activity = UpdateActivity(tiptoe: tiptoe, videoWork: .shared)
         justUpdatedVersion = tiptoe.justUpdatedTo
     }
 
@@ -155,12 +151,6 @@ final class SilentUpdates {
         #endif
     }
 
-    func videoWorkChanged() {
-        #if !DEBUG
-            activity.videoWorkChanged()
-        #endif
-    }
-
     /// Copies Tiptoe's state into the observable properties. Called when the popover appears,
     /// every ``mirrorInterval``, and after update actions — Tiptoe has no change callback.
     func refresh() {
@@ -179,7 +169,7 @@ final class SilentUpdates {
         // The background check shares AppUpdater's metadata request and can prepare the download.
         Task { await check() }
         do {
-            availableVersion = try await updater.check()?.version
+            _ = try await checkForRelease()
         } catch {
             return
         }
@@ -215,7 +205,7 @@ final class SilentUpdates {
         Task { [weak panel] in
             let result: Result<String?, any Error>
             do {
-                result = try await .success(updater.check()?.version)
+                result = try await .success(checkForRelease()?.version)
             } catch {
                 result = .failure(error)
             }
@@ -322,10 +312,15 @@ final class SilentUpdates {
         }
     }
 
-    private func checkCandidate() async throws -> UpdateActivity.Candidate? {
+    private func checkForRelease() async throws -> Update? {
         let update = try await updater.check()
         availableVersion = update?.version
-        guard let update else { return nil }
+        lastCheckedAt = .now
+        return update
+    }
+
+    private func checkCandidate() async throws -> UpdateActivity.Candidate? {
+        guard let update = try await checkForRelease() else { return nil }
         return UpdateActivity.Candidate(version: update.version) {
             let prepared = try await update.prepareInstallation()
             return UpdateActivity.Download(
@@ -382,16 +377,6 @@ final class SilentUpdates {
             tiptoe.acknowledge()
         }
         justUpdatedVersion = nil
-    }
-
-    // MARK: - The gate
-
-    /// Restarting the app mid-optimization would kill the transcode; everything else the app
-    /// does survives a restart (the wallpaper extension is its own process). A missing manager
-    /// answers "not safe" — an update is never so urgent that it is worth guessing.
-    private static func noOptimizationRunning() -> Bool {
-        guard let manager = PhospheneManager.shared else { return false }
-        return !manager.isOptimizing && ConversionToolModel.runningJobCount == 0
     }
 }
 

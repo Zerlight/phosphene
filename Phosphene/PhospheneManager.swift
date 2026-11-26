@@ -12,9 +12,7 @@ final class PhospheneManager {
 
     // MARK: - Optimization State
 
-    private(set) var isOptimizing = false {
-        didSet { SilentUpdates.shared.videoWorkChanged() }
-    }
+    private(set) var isOptimizing = false
     private(set) var optimizationProgress: Double = 0
     private(set) var optimizingEntryID: String?
     /// Whether the running operation re-encodes the entry's original file as HEVC.
@@ -145,17 +143,18 @@ final class PhospheneManager {
     }
 
     func optimize(_ target: VideoOptimizationTarget, preset: OptimizationPreset, convertToSDR: Bool) {
-        guard !isOptimizing, !SilentUpdates.shared.isReplacingApp, target.tiers.isEmpty else { return }
+        guard !isOptimizing, target.tiers.isEmpty else { return }
         let title = String(localized: "Couldn't optimize the video.")
         if let error = target.eligibilityError {
             reportLibraryError(error, title: title)
             return
         }
+        guard VideoWorkGate.shared.beginWork() else { return }
         isOptimizing = true
         optimizingEntryID = target.id
         optimizationProgress = 0
         optimizationTask = Task {
-            defer { finishOptimization() }
+            defer { finishVideoWork() }
             do {
                 try Task.checkCancellation()
                 try await target.optimize(
@@ -181,8 +180,9 @@ final class PhospheneManager {
     /// selections that use it. Shares the optimization state, so one conversion or
     /// optimization runs at a time and app updates wait for it.
     func convertToHEVC(entryID: String) {
-        guard !isOptimizing, !SilentUpdates.shared.isReplacingApp,
-              let entry = VideoDeploymentService.listEntries().first(where: { $0.id == entryID })
+        guard !isOptimizing,
+              let entry = VideoDeploymentService.listEntries().first(where: { $0.id == entryID }),
+              VideoWorkGate.shared.beginWork()
         else { return }
         isOptimizing = true
         isConverting = true
@@ -190,7 +190,7 @@ final class PhospheneManager {
         optimizationProgress = 0
 
         optimizationTask = Task(name: "Convert to HEVC") {
-            defer { finishOptimization() }
+            defer { finishVideoWork() }
             do {
                 try Task.checkCancellation()
                 try await VideoDeploymentService.convertToHEVC(entry: entry) { self.optimizationProgress = $0 }
@@ -218,15 +218,15 @@ final class PhospheneManager {
     }
 
     func cancelOptimization() {
-        // Keep the update gate closed until the cancelled task finishes its cleanup.
         optimizationTask?.cancel()
     }
 
-    private func finishOptimization() {
+    private func finishVideoWork() {
         optimizationTask = nil
         isOptimizing = false
         isConverting = false
         optimizingEntryID = nil
+        VideoWorkGate.shared.endWork()
     }
 
     // MARK: - Private

@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import notify
@@ -89,10 +90,6 @@ nonisolated struct ReportingState: Codable, Equatable {
     var legacyStatistics: LegacyStatisticsChoice?
     private var blockedRevocations: Set<ReportingStream>?
 
-    static var recovery: Self {
-        Self(requiredRevocations: [.statistics, .crashes])
-    }
-
     func isBlocked(_ stream: ReportingStream) -> Bool {
         blockedRevocations?.contains(stream) == true
     }
@@ -128,38 +125,75 @@ nonisolated struct ReportingStore {
     let url: URL
     static let notification = "glass.kagerou.phosphene.reportingChanged"
 
+    var useNotification: String {
+        let scope = SHA256.hash(data: Data(url.standardizedFileURL.path.utf8))
+        return "glass.kagerou.phosphene.reportingUsed.\(Data(scope).base64EncodedString())"
+    }
+
+    func notifyUse() {
+        _ = unsafe notify_post(useNotification)
+    }
+
     func initialize(
         initial: () -> ReportingState,
         retireLegacy: (() -> Void)?,
+        recoveringConsent: Bool = false,
         configure: (inout ReportingState) -> Void,
     ) throws -> ReportingState {
-        try withJournalLock {
+        let result = try withJournalLock {
             let retired = sibling("Reporting.migrated")
-            let alreadyMigrated = FileManager.default.fileExists(atPath: retired.path)
-            let existing = try load()
-            var state = existing ?? (alreadyMigrated ? .recovery : initial())
+            let alreadyMigrated: Bool
+            do {
+                _ = try FileManager.default.attributesOfItem(atPath: retired.path)
+                alreadyMigrated = true
+                retireLegacy?()
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                alreadyMigrated = false
+            }
+
+            let existing: ReportingState?
+            var malformed = false
+            do {
+                existing = try ReportingState.load(from: url)
+            } catch is DecodingError where recoveringConsent {
+                existing = nil
+                malformed = true
+            }
+            var state: ReportingState
+            if let existing {
+                state = existing
+            } else if alreadyMigrated || malformed {
+                guard recoveringConsent else { throw CocoaError(.fileReadNoSuchFile) }
+                state = ReportingState()
+            } else {
+                state = initial()
+            }
             configure(&state)
-            if existing != state {
+            let changed = existing != state
+            if changed {
                 try state.save(to: url)
             }
-            if let retireLegacy {
-                if !alreadyMigrated {
-                    try Data().write(to: retired, options: .atomic)
-                }
-                retireLegacy()
+            if !alreadyMigrated {
+                try Data().write(to: retired, options: .atomic)
+                retireLegacy?()
             }
-            return state
+            return (state, changed)
         }
+        if result.1 {
+            _ = unsafe notify_post(Self.notification)
+        }
+        return result.0
     }
 
     func read() throws -> ReportingState {
-        try load() ?? .recovery
+        guard let state = try ReportingState.load(from: url) else { throw CocoaError(.fileReadNoSuchFile) }
+        return state
     }
 
     func edit(_ change: (inout ReportingState) -> Void) throws -> ReportingState {
         let result = try withJournalLock {
-            let existing = try load()
-            var state = existing ?? .recovery
+            let existing = try read()
+            var state = existing
             change(&state)
             let changed = existing != state
             if changed {
@@ -182,14 +216,6 @@ nonisolated struct ReportingStore {
             return nil
         }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-    }
-
-    private func load() throws -> ReportingState? {
-        do {
-            return try ReportingState.load(from: url)
-        } catch is DecodingError {
-            return .recovery
-        }
     }
 
     private func withJournalLock<T>(_ work: () throws -> T) throws -> T {
@@ -218,9 +244,9 @@ nonisolated struct ReportingStore {
 final nonisolated class ReportingStoreObserver {
     private let token: Int32
 
-    init?(handler: @escaping @Sendable () -> Void) {
+    init?(name: String = ReportingStore.notification, handler: @escaping @Sendable () -> Void) {
         var token: Int32 = 0
-        let status = unsafe notify_register_dispatch(ReportingStore.notification, &token, .main) { _ in handler() }
+        let status = unsafe notify_register_dispatch(name, &token, .main) { _ in handler() }
         guard status == UInt32(NOTIFY_STATUS_OK) else { return nil }
         self.token = token
     }
