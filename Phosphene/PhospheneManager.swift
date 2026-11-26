@@ -100,7 +100,7 @@ final class PhospheneManager {
         occlusionMonitor.startMonitoring()
 
         SilentUpdates.shared.start(autoInstall: autoUpdate)
-        UsageCounting.start()
+        UsageCounting.shared.noteUse()
     }
 
     // MARK: - Library Actions

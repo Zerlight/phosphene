@@ -3,6 +3,7 @@ import AppUpdater
 import Foundation
 import Observation
 import os
+import SwiftUI
 import Tiptoe
 
 /// The app's updater: downloads from GitHub Releases, verifies, and swaps the bundle in place —
@@ -44,8 +45,8 @@ final class SilentUpdates {
     /// fails and leaves the next try to the loop.
     private static let wakeGrace: Duration = .seconds(20)
 
-    /// How long ``checkedUpToDate`` stays true after a manual check that found nothing newer.
-    private static let upToDateNotice: Duration = .seconds(3)
+    /// How long the chip shows the result of a check that found no installable update.
+    private static let checkNoticeDuration: Duration = .seconds(3)
 
     /// How often ``refresh()`` copies Tiptoe's in-memory state into the observable properties,
     /// so the menu bar badge appears without the popover being opened. No network involved.
@@ -78,10 +79,8 @@ final class SilentUpdates {
     /// True while a check the user asked for is in flight, for the version chip.
     private(set) var isChecking = false
 
-    /// True for ``upToDateNotice`` after a check the user asked for found nothing newer. "Nothing
-    /// newer" and "couldn't reach GitHub" look the same from here, so this can be a beat
-    /// optimistic offline; the loop and the next popover open self-correct.
-    private(set) var checkedUpToDate = false
+    /// True briefly after a successful explicit check found no installable update.
+    private(set) var checkedNoInstallableUpdate = false
 
     /// The updater: check loop, plus the quiet-moment install when auto-update is on.
     /// Created up front so its `Tiptoe` reconciles the recorded wait and the post-update notice
@@ -92,6 +91,7 @@ final class SilentUpdates {
     @ObservationIgnored private let tiptoe: Tiptoe
     @ObservationIgnored private let updater: AppUpdater
     @ObservationIgnored private let activity: UpdateActivity
+    @ObservationIgnored private var checkingPanel: NSPanel?
     @ObservationIgnored private var checkLoop: Task<Void, Never>?
     @ObservationIgnored private var mirrorTask: Task<Void, Never>?
     @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
@@ -164,14 +164,108 @@ final class SilentUpdates {
     func checkForUpdates() async {
         guard !isChecking else { return }
         isChecking = true
-        checkedUpToDate = false
-        await check()
-        isChecking = false
-        guard availableVersion == nil, pendingVersion == nil else { return }
-        checkedUpToDate = true
-        Task(name: "Clear the up-to-date notice") { [weak self] in
-            try? await Task.sleep(for: Self.upToDateNotice)
-            self?.checkedUpToDate = false
+        checkedNoInstallableUpdate = false
+        defer { isChecking = false }
+        // The background check shares AppUpdater's metadata request and can prepare the download.
+        Task { await check() }
+        do {
+            _ = try await checkForRelease()
+        } catch {
+            return
+        }
+        guard availableVersion == nil, activity.pendingVersion == nil else { return }
+        checkedNoInstallableUpdate = true
+        Task(name: "Clear the update check notice") { [weak self] in
+            try? await Task.sleep(for: Self.checkNoticeDuration)
+            self?.checkedNoInstallableUpdate = false
+        }
+    }
+
+    /// Presents the result of an explicit check from the application menu.
+    func checkForUpdates(autoInstall: Bool) {
+        if let checkingPanel {
+            checkingPanel.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let content = NSHostingView(rootView: UpdateCheckProgressView { [weak self] in
+            self?.dismissCheck()
+        })
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: content.fittingSize),
+            styleMask: [.titled], backing: .buffered, defer: false,
+        )
+        panel.title = String(localized: "Software Update")
+        panel.isReleasedWhenClosed = false
+        panel.contentView = content
+        checkingPanel = panel
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+
+        Task { [weak panel] in
+            let result: Result<String?, any Error>
+            do {
+                result = try await .success(checkForRelease()?.version)
+            } catch {
+                result = .failure(error)
+            }
+            // AppUpdater shares its metadata request with the background updater.
+            guard let panel, checkingPanel === panel else { return }
+            dismissCheck()
+            switch result {
+            case let .success(version?):
+                showAvailableUpdate(version: version, autoInstall: autoInstall)
+            case .success(nil):
+                let notice = NSAlert()
+                notice.messageText = String(localized: "No installable update found")
+                notice.addButton(withTitle: String(localized: "Done"))
+                notice.addButton(withTitle: String(localized: "View on GitHub"))
+                if notice.runModal() == .alertSecondButtonReturn {
+                    NSWorkspace.shared.open(Self.releasesPageURL)
+                }
+            case let .failure(error):
+                let notice = NSAlert()
+                notice.alertStyle = .warning
+                notice.messageText = String(localized: "Couldn’t check for updates")
+                notice.informativeText = error.localizedDescription
+                notice.addButton(withTitle: String(localized: "Try Again"))
+                notice.addButton(withTitle: String(localized: "Cancel")).keyEquivalent = "\u{1b}"
+                if notice.runModal() == .alertFirstButtonReturn {
+                    checkForUpdates(autoInstall: autoInstall)
+                }
+            }
+        }
+    }
+
+    private func dismissCheck() {
+        checkingPanel?.close()
+        checkingPanel = nil
+    }
+
+    private func showAvailableUpdate(version: String, autoInstall: Bool) {
+        dismissFailure()
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Phosphene \(version) is available")
+        alert.alertStyle = .informational
+        #if DEBUG
+            alert.addButton(withTitle: String(localized: "View on GitHub"))
+        #else
+            alert.addButton(withTitle: String(localized: "Update Now"))
+        #endif
+        alert.addButton(withTitle: String(localized: "Later")).keyEquivalent = "\u{1b}"
+        alert.addButton(withTitle: String(localized: "Release Notes"))
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            #if DEBUG
+                NSWorkspace.shared.open(Self.releasesPageURL)
+            #else
+                WhatsNewWindow.present(version: version, context: .updateAvailable(autoInstall: autoInstall))
+                Task { await updateNow(version: version) }
+            #endif
+        case .alertThirdButtonReturn:
+            WhatsNewWindow.present(version: version, context: .updateAvailable(autoInstall: autoInstall))
+        default:
+            break
         }
     }
 
@@ -283,5 +377,35 @@ final class SilentUpdates {
             tiptoe.acknowledge()
         }
         justUpdatedVersion = nil
+    }
+}
+
+private struct UpdateCheckProgressView: View {
+    let cancel: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 60, height: 60)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Checking for updates…")
+                    .font(.headline)
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .accessibilityLabel("Checking for updates…")
+                Button(action: cancel) {
+                    Text("Cancel").frame(minWidth: 72)
+                }
+                .keyboardShortcut(.cancelAction)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .frame(width: 400)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
