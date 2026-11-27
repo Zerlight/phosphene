@@ -520,7 +520,7 @@ private struct InspectorNameField: View {
                     .onExitCommand { finish(commit: false) }
                     .onChange(of: isFocused) { _, focused in
                         if !focused {
-                            finish(commit: true)
+                            finish(commit: false)
                         }
                     }
                     .task { isFocused = true }
@@ -545,7 +545,6 @@ private struct InspectorNameField: View {
         )
         .padding(.horizontal, -5)
         .onHover { isHovered = $0 }
-        .onDisappear { finish(commit: true) }
     }
 
     private func finish(commit: Bool) {

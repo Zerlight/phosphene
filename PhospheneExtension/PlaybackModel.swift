@@ -118,6 +118,7 @@ nonisolated struct Surface: Equatable, Sendable {
     var mode: PresentationMode
     var activity: ActivityState
     var awaitingReacquire = false
+    var canHandOffSelectionMotion = true
     /// Whether the event that last touched this surface ramps a policy change it
     /// causes, as opposed to cutting to it.
     var ramps = false
@@ -148,10 +149,9 @@ nonisolated enum PlaybackEvent: Sendable, CustomStringConvertible {
     case surfaceAcquired(SurfaceKey, displayID: UInt32?, role: SurfaceRole, choice: String?, appearance: PairAppearanceMode = .automatic)
     case systemAppearanceChanged(dark: Bool)
     case appearanceSelected(SurfaceKey, PairAppearanceMode)
-    case surfaceInvalidated(SurfaceKey)
+    case surfaceInvalidated(SurfaceKey, isPaired: Bool)
     case surfaceRemoved(SurfaceKey)
-    /// An `update` from WallpaperAgent. `nil` when the request's WallpaperID is not one
-    /// we acquired; the update then applies to every surface.
+    /// A WallpaperAgent presentation update. An unaddressed update applies to all surfaces.
     case agentUpdate(SurfaceKey?, mode: PresentationMode, activity: ActivityState)
     case screenLockChanged(Bool)
     case displaysAsleepChanged(Bool)
@@ -160,11 +160,16 @@ nonisolated enum PlaybackEvent: Sendable, CustomStringConvertible {
     case shufflePicked(String?)
     case videoRemoved(String)
 
+    static func agentUpdate(wallpaperUUID: UUID?, resolved key: SurfaceKey?, mode: PresentationMode, activity: ActivityState) -> Self? {
+        guard wallpaperUUID == nil || key != nil else { return nil }
+        return .agentUpdate(key, mode: mode, activity: activity)
+    }
+
     var description: String {
         switch self {
         case .systemAppearanceChanged: "systemAppearanceChanged"
         case let .appearanceSelected(key, mode): "appearanceSelected(\(key), \(mode))"
-        case let .surfaceInvalidated(key): "surfaceInvalidated(\(key))"
+        case let .surfaceInvalidated(key, isPaired): "surfaceInvalidated(\(key), paired: \(isPaired))"
         case let .surfaceAcquired(key, _, role, choice, _): "surfaceAcquired(\(key), \(role), \(choice ?? "nil"))"
         case let .surfaceRemoved(key): "surfaceRemoved(\(key))"
         case let .agentUpdate(key, mode, activity): "agentUpdate(\(key.map(\.description) ?? "all"), \(mode), \(activity))"
@@ -218,11 +223,13 @@ nonisolated enum PlaybackReducer {
         case let .surfaceAcquired(key, displayID, role, choice, appearance):
             next.acquire(key, displayID: displayID, role: role, choice: choice)
             next.surfaces[key]?.appearance = appearance
-        case let .surfaceInvalidated(key):
-            next.surfaces[key]?.awaitingReacquire = true
+        case let .surfaceInvalidated(key, isPaired):
+            next.surfaces[key]?.canHandOffSelectionMotion = false
+            if isPaired {
+                next.surfaces[key]?.awaitingReacquire = true
+            }
         case let .surfaceRemoved(key):
             next.surfaces[key] = nil
-            next.setRamps { _ in false }
         case let .agentUpdate(key, mode, activity):
             next.update(key, mode: mode, activity: activity)
         case let .screenLockChanged(locked):
@@ -262,7 +269,7 @@ nonisolated enum PlaybackReducer {
               target(for: current, in: state).allowsSelectionPlayback,
               let choice = current.choice, let previous = predecessor(of: key, in: state),
               let previousChoice = previous.surface.choice, previousChoice != choice,
-              !previous.surface.awaitingReacquire else { return nil }
+              previous.surface.canHandOffSelectionMotion else { return nil }
         return previous.key
     }
 
@@ -327,7 +334,11 @@ nonisolated enum PlaybackReducer {
 private nonisolated extension PlaybackState {
     mutating func acquire(_ key: SurfaceKey, displayID: UInt32?, role: SurfaceRole, choice: String?) {
         if var surface = surfaces[key] {
-            surface.awaitingReacquire = false
+            surface.canHandOffSelectionMotion = true
+            if surface.awaitingReacquire {
+                surface.awaitingReacquire = false
+                surface.activity = .active
+            }
             surface.displayID = displayID
             surface.role = role
             surface.choice = choice
@@ -338,12 +349,17 @@ private nonisolated extension PlaybackState {
             let predecessor = surfaces.values
                 .filter { $0.role == role && $0.displayID == displayID }
                 .max { $0.generation < $1.generation }
+            let activity: ActivityState = if let predecessor, !predecessor.awaitingReacquire {
+                predecessor.activity
+            } else {
+                .active
+            }
             surfaces[key] = Surface(
                 displayID: displayID,
                 role: role,
                 choice: choice,
                 mode: predecessor?.mode ?? .default,
-                activity: predecessor?.activity ?? .active,
+                activity: activity,
                 generation: nextGeneration,
             )
             nextGeneration += 1
@@ -359,7 +375,6 @@ private nonisolated extension PlaybackState {
     mutating func update(_ key: SurfaceKey?, mode: PresentationMode, activity: ActivityState) {
         let affected = key.map { [$0] } ?? Array(surfaces.keys)
         let rampsPresentation = prefs.alwaysPauseDesktop && activity == .active
-        setRamps { _ in false }
         for key in affected {
             guard var surface = surfaces[key] else { continue }
             surface.ramps = rampsPresentation && surface.mode != mode
